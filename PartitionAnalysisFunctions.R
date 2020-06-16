@@ -1,0 +1,278 @@
+#####--------------------------------------------------------------------------------------------------#####
+#####---------------- Functions for cost-effectiveness Analysis -- Partitioned version ----------------#####
+#####--------------------------------------------------------------------------------------------------#####
+
+lg <- function(x)c(NA, x[1:(length(x)-1)])
+# Estimate PS using logistic regression
+# Outcome: treatment A 
+# Predictor: covariate Xs
+EstPS = function(A,Xs){
+  if(ncol(as.matrix(A))!=1) stop("Multiple treatments are not allowed")
+  if(length(A)!= nrow(as.matrix(Xs))) stop("Non-conformable between outcome and predictors")
+  if(length(unique(A))<=1) stop("Outcome levels are less than 2")
+  level.A = sort(unique(A))
+  
+  dat = data.frame(A,Xs)
+  PSfit = glm(A ~., family="binomial", data=dat)
+  p = predict(PSfit,dat,type = "response")
+  PS = data.frame((1-p),p);names(PS) = paste("A=",level.A,sep="");PS  
+}
+
+# Estimate survival time using AFT model with Exponential distribution 
+# Outcome: survival time ST (continuous)
+# Event indicator: event
+# Predictor: treatment A, main covariates Xs, and interaction Ms(*A).
+Reg.mu.surv = function(ST,event,A,Xs,Ms,tau,data){
+  
+  N = dim(data)[1]
+  Xs = as.matrix(Xs); Ms = as.matrix(Ms)
+  fitsurvT = survreg(Surv(time = ST, event = event) ~ Xs+A+A:Ms, dist="lognormal",data=data)
+  
+  # estimate location parameter ui (on the log scale) for each individual & under each treament arm 
+  log.survT = matrix(NA,N,2)
+  for(j in 1:2){
+    newdat=data; newdat$A = rep(sort(unique(A))[j],N)
+    log.survT[,j] = log(predict(fitsurvT,newdata=newdat,type = "response"))
+  }
+  
+  mulog0 = log.survT[,1];mulog1 = log.survT[,2];sdlog=summary(fitsurvT)$scale
+  mus.survRT = matrix(NA,N,2)
+  for (i in 1:N){
+    # survival function for each arm, same sd is used
+    S_t0 = function(t){plnorm(t,meanlog=mulog0[i],sdlog=sdlog,lower.tail = FALSE)}
+    S_t1 = function(t){plnorm(t,meanlog=mulog1[i],sdlog=sdlog,lower.tail = FALSE)}
+    # integrate from 0 to tau
+    mus.survRT[i,1] = cubintegrate(S_t0,0,tau,method = "cuhre")$integral
+    mus.survRT[i,2] = cubintegrate(S_t1,0,tau,method = "cuhre")$integral
+  }
+  
+  outsurvRT = list(mus.survRT, fitsurvT);names(outsurvRT) = c("mus.survRT","SurvModel");outsurvRT
+}
+
+# Estimate cumulative cost using Gamma (log) model  
+# Outcome: cumulative cost CC (continuous)
+# Predictor: treatment A, main covariates Xs, and interaction Ms(*A).
+Reg.mu.gam = function(CC,A,Xs,Ms,data){
+  
+  N = nrow(as.matrix(A))
+  Xs = as.matrix(Xs)
+  Ms = as.matrix(Ms)
+  Coefini = coef(glm(CC ~ A, family = "Gamma"(link="log"),data = data))
+  
+  if(dim(Xs)[2]==6){
+    RegGamma = glm(CC ~ Xs+A+A:Ms, family = "Gamma"(link="log"),data = data,start=c(Coefini[1],rep(0,6),Coefini[2],rep(0,1)))
+  }else{
+    RegGamma = glm(CC ~ Xs+A+A:Ms, family = "Gamma"(link="log"),data = data,start=c(Coefini[1],rep(0,5),Coefini[2],rep(0,1)))
+  }
+  mus.gam = matrix(NA,N,2)
+  for(j in 1:2){
+    newdat=data; newdat$A = rep(sort(unique(A))[j],N)
+    mus.gam[,j] = predict(RegGamma,newdata=newdat, type="response")
+  }
+  
+  out.gam = list(mus.gam, RegGamma);names(out.gam) = c("mus.gam","Gamma");out.gam
+}
+
+# Estimate cumulative cost using Lognormal model  
+# Outcome: cumulative cost CC (continuous)
+# Predictor: treatment A, main covariates Xs, and interaction Ms(*A).
+# Reg.mu.norm = function(CC,A,Xs,Ms,data){
+#   #if(length(A) != dim(Xs)[1]|length(A) != dim(Ms)[1]|dim(Xs)[1] != dim(Ms)[1]) stop("Non-conformable between treatment and covariates")
+#   N = nrow(as.matrix(A))
+#   Xs = as.matrix(Xs)
+#   Ms = as.matrix(Ms)
+#   LA = length(unique(A))    
+#   if(LA<2) stop("Treatment levels are less than 2")
+#   
+#   RegNormal = glm(CC ~ Xs+A*Ms, family = "gaussian"(link="log"),data = data)
+#   mus.norm = matrix(NA,N,LA)
+#   for(j in 1:LA){
+#     newdat = data.frame(as.matrix(Xs), A=rep(sort(unique(A))[j],N),as.matrix(Ms))
+#     mus.norm[,j] = predict(RegNormal,newdata=newdat, type="response")
+#   }
+#   
+#   out.norm = list(mus.norm, RegNormal);names(out.norm) = c("mus.norm","LogNormal");out.norm
+# }
+
+####------------------------------------- IPW and AIPW Functions -------------------------------------------------####
+# Compute IPW estimates for individual treatment effect 
+# Q: Observed effectiveness; C: observed cumulative cost outcome 
+# A: Treatment; est_ps:estimated PS
+# cen: Censoring indicator; est_cen: censoring probability 
+# lambda: Willingness-to-pay parameter 
+ITR_IPW_P = function(Q,C,A,est_ps,cen,est_cen,long_ps,Mocen,Moest_cen,lambda,muQ.reg,datalong,data){
+  level.A = sort(unique(A))
+  level.cen = sort(unique(cen))
+  LA = length(level.A)
+  if(LA<2) stop("Treatment levels are less than 2")
+  if(dim(est_ps)[2]!=LA) stop("Different number of columns between treatment and PS")
+  
+  # IPW estimates 
+  muQ = muC = muQQ = matrix(NA,N,LA)
+  for(k in 1:LA){
+    muQ[,k] = cen*(A==level.A[k])*Q/est_ps[,k]
+    muC.long = (Mocen/Moest_cen)*((datalong$A==level.A[k])*C/long_ps[,k])
+    newdat = data.frame(datalong,muC.long)
+    muC[,k] = aggregate(newdat$muC.long, by=list(newdat$subjectid), FUN=sum, na.rm=TRUE)$x
+  }
+
+  # CE IPW estimates (impute the censored subjects with estimated CATE)
+  tempdat = data.frame(A, cen,muQ.reg,muQ);names(tempdat)[3:6]=c("regT0","regT1","muT0","muT1")
+  muQQ[,1] = ifelse(tempdat$cen==0, (1-tempdat$A)*tempdat$regT0, (1-tempdat$A)*tempdat$muT0)
+  muQQ[,2] = ifelse(tempdat$cen==0, tempdat$A*tempdat$regT1, tempdat$A*tempdat$muT1)
+  muY = lambda*muQQ-muC
+  
+  # create contrast estimates
+  Contrast.Y = Contrast.Q = Contrast.C = ITR_regCE = rep(NA,N)
+  for(j in 1:N){
+    # CE 
+    Contrast.Y[j] = max(muY[j,])-min(muY[j,])
+    # Effectiveness (survival time)
+    Contrast.Q[j] = max(muQQ[j,])-min(muQQ[j,])
+    # Cumulative cost
+    Contrast.C[j] = max(muC[j,])-min(muC[j,])
+    
+    # Treatment corresponds to preferred (higher) CE outcome
+    ITR_regCE[j] = which(muY[j,]==max(muY[j,]))-1
+  }
+  output = data.frame(Contrast.Q, Contrast.C, Contrast.Y, ITR_regCE)
+  output
+}
+
+
+# Compute IPW estimates for individual treatment effect 
+# Q: Observed effectiveness; C: observed cumulative cost outcome 
+# muQ.reg: Estimated effectiveness outcome; muC.reg: Estimated cumulative cost outcome
+# A: Treatment; est_ps:estimated PS
+# cen: Censoring indicator; est_cen: censoring probability 
+# lambda: Willingness-to-pay parameter 
+ITR_AIPW_P = function(Q,C,A,est_ps,cen,est_cen,long_ps,Mocen,Moest_cen,lambda,muQ.reg,muC.reg,datalong,data){
+  level.A = sort(unique(A))
+  level.cen = sort(unique(cen))
+  LA = length(level.A)
+  N = length(A)
+  if(LA<2) stop("Treatment levels are less than 2")
+  if(dim(est_ps)[2]!=LA|dim(muQ.reg)[2]!=LA|dim(muC.reg)[2]!=LA) stop("Number of columns are inconsistent")
+  
+
+  # AIPW estimates   
+  muQ = muC = muQQ = matrix(NA,N,LA)
+  for(k in 1:LA){
+    muQ[,k] = cen*((A==level.A[k])*Q/est_ps[,k]+(1-(A==level.A[k])/est_ps[,k])*muQ.reg[,k])
+    muC.long = (Mocen/Moest_cen)*((datalong$A==level.A[k])*C/long_ps[,k]+(1-(datalong$A==level.A[k])/long_ps[,k])*muC.reg[,k])
+    newdat = data.frame(datalong,muC.long)
+    muC[,k] = aggregate(newdat$muC.long, by=list(newdat$subjectid), FUN=sum, na.rm=TRUE)$x
+  }
+  
+  # CE AIPW estimates
+   tempdat = data.frame(cen,muQ.reg,muQ);names(tempdat)[2:5]=c("regT0","regT1","muT0","muT1")
+   muQQ[,1] = ifelse(tempdat$cen==0, tempdat$regT0, tempdat$muT0)
+   muQQ[,2] = ifelse(tempdat$cen==0, tempdat$regT1, tempdat$muT1)
+   muY = lambda*muQQ-muC
+  
+  # create contrast estimates
+  Contrast.Y = Contrast.Q = Contrast.C = ITR_regCE = rep(NA,N)
+  for(j in 1:N){
+    # CE 
+    Contrast.Y[j] = max(muY[j,])-min(muY[j,])
+    # Effectiveness (survival time)
+    Contrast.Q[j] = max(muQQ[j,])-min(muQQ[j,])
+    # Cumulative cost
+    Contrast.C[j] = max(muC[j,])-min(muC[j,])
+    
+    # Treatment corresponds to preferred (higher) CE outcome
+    ITR_regCE[j] = which(muY[j,]==max(muY[j,]))-1
+  }
+  output = data.frame(Contrast.Q, Contrast.C, Contrast.Y, ITR_regCE)
+  output
+}
+
+#####------------------------------------------------------------------------------------------------------#####
+#####---------------- Functions for cost-effectiveness Analysis -- Non-Partitioned version ----------------#####
+#####------------------------------------------------------------------------------------------------------#####
+
+# Compute IPW estimates for individual treatment effect 
+# Q: Observed effectiveness; C: observed cumulative cost outcome 
+# A: Treatment; est_ps:estimated PS
+# cen: Censoring indicator; est_cen: censoring probability 
+# lambda: Willingness-to-pay parameter 
+ITR_IPW_NP = function(Q,C,A,est_ps,cen,est_cen,lambda){
+  level.A = sort(unique(A))
+  level.cen = sort(unique(cen))
+  LA = length(level.A)
+  if(LA<2) stop("Treatment levels are less than 2")
+  if(dim(est_ps)[2]!=LA) stop("Different number of columns between treatment and PS")
+  
+  # IPW estimates
+  muQ = muC = matrix(NA,N,LA)
+  for(k in 1:LA){
+    muQ[,k] = (cen/est_cen)*((A==level.A[k])*Q/est_ps[,k])
+    muC[,k] = (cen/est_cen)*((A==level.A[k])*C/est_ps[,k])
+  }
+  
+  # CE IPW estimates
+  muY = lambda*muQ-muC
+  
+  # create contrast estimates
+  Contrast.Y = Contrast.Q = Contrast.C = ITR_regCE = ITR_regST = rep(NA,N)
+  for(j in 1:N){
+    # CE 
+    Contrast.Y[j] = max(muY[j,])-min(muY[j,])
+    # Effectiveness (survival time)
+    Contrast.Q[j] = max(muQ[j,])-min(muQ[j,])
+    # Cumulative cost
+    Contrast.C[j] = max(muC[j,])-min(muC[j,])
+    
+    # Treatment corresponds to preferred (higher) CE outcome
+    ITR_regCE[j] = ifelse(cen[j]==0, NA, which(muY[j,]==max(muY[j,]))-1)
+    # Treatment corresponds to preferred (higher) effectiveness outcome
+    ITR_regST[j] = ifelse(cen[j]==0, NA, which(muQ[j,]==max(muQ[j,]))-1)
+  }
+  output = data.frame(Contrast.Q, Contrast.C, Contrast.Y, ITR_regCE, ITR_regST)
+  output
+}
+
+
+# Compute IPW estimates for individual treatment effect 
+# Q: Observed effectiveness; C: observed cumulative cost outcome 
+# muQ.reg: Estimated effectiveness outcome; muC.reg: Estimated cumulative cost outcome
+# A: Treatment; est_ps:estimated PS
+# cen: Censoring indicator; est_cen: censoring probability 
+# lambda: Willingness-to-pay parameter 
+ITR_AIPW_NP = function(Q,C,A,est_ps,cen,est_cen,muQ.reg,muC.reg,lambda){
+  level.A = sort(unique(A))
+  level.cen = sort(unique(cen))
+  LA = length(level.A)
+  N = length(A)
+  if(LA<2) stop("Treatment levels are less than 2")
+  if(dim(est_ps)[2]!=LA|dim(muQ.reg)[2]!=LA|dim(muC.reg)[2]!=LA) stop("Number of columns are inconsistent")
+
+  # AIPW estimates
+  muQ = muC = matrix(NA,N,LA)
+  for(k in 1:LA){
+    muQ[,k] = (cen/est_cen)*((A==level.A[k])*Q/est_ps[,k]+(1-(A==level.A[k])/est_ps[,k])*muQ.reg[,k])
+    muC[,k] = (cen/est_cen)*((A==level.A[k])*C/est_ps[,k]+(1-(A==level.A[k])/est_ps[,k])*muC.reg[,k])
+  }
+
+  # CE AIPW estimates
+  muY = lambda*muQ-muC
+
+  # create contrast estimates
+  Contrast.Y = Contrast.Q = Contrast.C = ITR_regCE = ITR_regST = rep(NA,N)
+  for(j in 1:N){
+    # CE
+    Contrast.Y[j] = max(muY[j,])-min(muY[j,])
+    # Effectiveness (survival time)
+    Contrast.Q[j] = max(muQ[j,])-min(muQ[j,])
+    # Cumulative cost
+    Contrast.C[j] = max(muC[j,])-min(muC[j,])
+
+    # Treatment corresponds to preferred (higher) CE outcome
+    ITR_regCE[j] = ifelse(cen[j]==0, NA, which(muY[j,]==max(muY[j,]))-1)
+    # Treatment corresponds to preferred (higher) effectiveness outcome
+    ITR_regST[j] = ifelse(cen[j]==0, NA, which(muQ[j,]==max(muQ[j,]))-1)
+  }
+  output = data.frame(Contrast.Q, Contrast.C, Contrast.Y, ITR_regCE, ITR_regST)
+  output
+}
+
