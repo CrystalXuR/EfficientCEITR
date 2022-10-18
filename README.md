@@ -1,4 +1,4 @@
-# EfficientCElITR
+# EfficientCEITR
 This package is developed for the paper entitled "An Efficient Approach for Optimizing the Cost-effective Individualized Treatment Rule Using Conditional Random Forest". This set of code implements the proposed methods in the paper to estimate the most cost-effective individualized treatment rule in an efficient way. Specifically, we use the concept of net-monetary-benefit (NMB) to assess the tradeoff between health benefits and additional costs. We estimate ITRs as a function of patients' characteristics that, when implemented, optimizes the allocation of limited healthcare resources by maximizing health gains while minimizing treatment-related costs. We apply the conditional random forest approach and identify the optimal CE ITR using an NMB-based classification algorithm, where we propose two partitioned estimators for the subject-specific weights to effectively incorporate information from censored subjects, thus improving estimation efficiency. 
 
 - "EfficientCEITR.R" contains all the functions we programmed for implementing the methods 
